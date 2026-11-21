@@ -15,7 +15,8 @@ Names format: usually `eval-<run>-<positions>B`, where the number is the trainin
 | eval-71, eval-75 | `(32x768 -> 1024)x2 -> 1`, CReLU, 32 king buckets, 8 output buckets by piece count | 12 |
 | eval-82-383B, eval-84-144B | same, SCReLU | 12 |
 | eval-ml-5-200B-permuted, eval-ml-6-160B | `(32x768 -> 1024)x2 -> pairwise CReLU -> 16 -> 32 -> 1`, 8 output buckets at every head layer | 14 |
-| eval-ml-8-152B-* and later | `(32x768 -> 1536)x2 -> pairwise CReLU -> 16 -> 32 -> 1` | 15 |
+| eval-ml-8-152B-*, eval-ml-11a-100B-spsa-transplant | `(32x768 -> 1536)x2 -> pairwise CReLU -> 16 -> 32 -> 1` | 15 |
+| eval-ml-14-q16-80B-spsa-transplant | same, 16 output buckets: 8 by piece count x any queen on the board | 17 |
 
 ## Summary
 
@@ -31,7 +32,8 @@ Elo is against the previous master net, from the SPRTs quoted in the Caissa comm
 | eval-ml-6-160B | 2026-09-13 (`590bb44`) | | head-only fine-tune of eval-ml-5, FT frozen | +3.30 ± 1.92 | |
 | eval-ml-8-152B-permuted | 2026-09-16 (`0117173`) | | first 1536-wide net, 2 stages | +1.58 ± 1.19 | +7.32 ± 3.54 |
 | eval-ml-8-152B-spsa | 2026-09-19 (`34082cc`) | 2.0 | last layer SPSA-tuned (231 params, 108K games) | +5.97 ± 2.73 | +6.09 ± 3.21 |
-| eval-ml-11a-100B-spsa-transplant | added 2026-10-17 | | stage-3 fine-tune of eval-ml-8 + the SPSA tune "transplanted" | +3.47 ± 2.00 | +0.98 ± 1.25 |
+| eval-ml-11a-100B-spsa-transplant | 2026-10-17 (`8d2454c`) | | stage-3 fine-tune of eval-ml-8 + the SPSA tune "transplanted" | +3.47 ± 2.00 | +0.98 ± 1.25 |
+| eval-ml-14-q16-80B-spsa-transplant | 2026-11-13 (`3125ca7`) | | output buckets split by queens, head-only fine-tune of eval-ml-11a + the SPSA transplant | +1.40 ± 1.08 | +1.35 ± 1.28 |
 
 ## Details
 
@@ -116,3 +118,23 @@ Elo is against the previous master net, from the SPRTs quoted in the Caissa comm
   buckets 1-7, with `scripts/patchNetLastLayer.py`. No re-tuning.
 - vs eval-ml-8-152B-spsa: STC +3.47 ± 2.00 (https://furybench.com/test/7644/), LTC +0.98 ± 1.25 with
   non-regression bounds, stopped at 70K games (https://furybench.com/test/7645/).
+
+### eval-ml-14-q16-80B-spsa-transplant
+- First net with 16 output buckets: bucket = `min(non-king pieces / 4, 7) * 2 + (any queen on the board)`. Net
+  format 17. Caissa commit `c74b73c` (branch `queen-output-buckets`), which also adds the trainer option
+  `--frozenVariants`.
+- Start net: eval-ml-11a-100B-permuted (eval-ml-11a before the SPSA transplant) converted to format 17 by copying
+  each of its 8 heads twice, so it evaluates exactly like the 8-bucket net (same bench).
+- Stage 4 (eval-ml-14-q16), head-only fine-tune: `trainCudaNetwork --net eval-ml-11a-100B-permuted-q16.pnn --LR 5e-5
+  --endLR 1e-6 --name eval-ml-14-q16 --startLambda 0 --endLambda 0 --trainingLength 80 --bucketLeak 0.5
+  --freezeFeatureTransformer --frozenVariants 0,1,14,15`. Feature transformer frozen; heads 0, 1, 14 and 15 frozen
+  (piece-count buckets 0 and 7, which have few positions) and byte-identical to the start net. Fresh Adam moments,
+  50-iteration warmup, cosine LR over 80B then constant 1e-6, stopped at 102B; seed 12345, batch 32768, AdamW
+  0.9 / 0.999, subnet decay 0, factorizer on, no neuron revival. Same data as eval-ml-11a (2849 files, 21.0B
+  positions). RTX 5070, 3.22M positions/s.
+- Validation RMSE 0.12333 at the start -> 0.12319, flat after 70B. The 80B checkpoint was used.
+- SPSA transplant: the per-weight last-layer difference of eval-ml-11a-100B-spsa-transplant minus
+  eval-ml-11a-100B-permuted (the eval-ml-8 SPSA tune) for old bucket b was added to new buckets 2b and 2b+1.
+  No re-tuning.
+- vs eval-ml-11a-100B-spsa-transplant: STC +1.40 ± 1.08 (https://furybench.com/test/8043/), LTC +1.35 ± 1.28 with
+  non-regression bounds (https://furybench.com/test/8045/).
