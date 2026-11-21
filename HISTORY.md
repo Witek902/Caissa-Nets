@@ -17,6 +17,7 @@ Names format: usually `eval-<run>-<positions>B`, where the number is the trainin
 | eval-ml-5-200B-permuted, eval-ml-6-160B | `(32x768 -> 1024)x2 -> pairwise CReLU -> 16 -> 32 -> 1`, 8 output buckets at every head layer | 14 |
 | eval-ml-8-152B-*, eval-ml-11a-100B-spsa-transplant | `(32x768 -> 1536)x2 -> pairwise CReLU -> 16 -> 32 -> 1` | 15 |
 | eval-ml-14-q16-80B-spsa-transplant | same, 16 output buckets: 8 by piece count x any queen on the board | 17 |
+| eval-ti-2-120B-permuted | `(32x768 -> 768)x2` piece accumulators + `(60144 threats -> 768)x2` int8 threat accumulators, summed `-> pairwise CReLU -> 16 -> 32 -> 1`, 16 output buckets as above | 18 |
 
 ## Summary
 
@@ -34,6 +35,7 @@ Elo is against the previous master net, from the SPRTs quoted in the Caissa comm
 | eval-ml-8-152B-spsa | 2026-09-19 (`34082cc`) | 2.0 | last layer SPSA-tuned (231 params, 108K games) | +5.97 ± 2.73 | +6.09 ± 3.21 |
 | eval-ml-11a-100B-spsa-transplant | 2026-10-17 (`8d2454c`) | | stage-3 fine-tune of eval-ml-8 + the SPSA tune "transplanted" | +3.47 ± 2.00 | +0.98 ± 1.25 |
 | eval-ml-14-q16-80B-spsa-transplant | 2026-11-13 (`3125ca7`) | | output buckets split by queens, head-only fine-tune of eval-ml-11a + the SPSA transplant | +1.40 ± 1.08 | +1.35 ± 1.28 |
+| eval-ti-2-120B-permuted | not the default (branch `threat-inputs`), added 2026-11-21 | | first threat-input net, from scratch in 2 stages, no SPSA | | |
 
 ## Details
 
@@ -138,3 +140,31 @@ Elo is against the previous master net, from the SPRTs quoted in the Caissa comm
   No re-tuning.
 - vs eval-ml-11a-100B-spsa-transplant: STC +1.40 ± 1.08 (https://furybench.com/test/8043/), LTC +1.35 ± 1.28 with
   non-regression bounds (https://furybench.com/test/8045/).
+
+### eval-ti-2-120B-permuted
+- First net with threat inputs: 60,144 features (attacker piece and square, victim piece and square, seen from the
+  perspective; kings are neither attackers nor victims, pawns attack only pawns, knights and rooks, bishops and
+  rooks do not attack queens, a pair of same-type pieces is counted once). Their int8 weights fill a separate
+  threat accumulator per perspective, added to the piece accumulator before the pairwise activation. Accumulator
+  width 768 (eval-ml-14: 1536), net format 18, 84.2 MB. Caissa branch `threat-inputs` (from `4ea280e`), not merged.
+- Trained from scratch, data as eval-ml-11a (2849 files, 21.0B positions). Threat weights clipped to ±127/255
+  with quantization-aware training, no weight decay, initialised N(0, 0.005).
+- Stage 1 (eval-ti-1): `trainCudaNetwork --LR 1e-3 --endLR 5e-6 --startLambda 0.9 --endLambda 0.5
+  --trainingLength 100 --iterations 47700 --bucketLeak 0.5 --name eval-ti-1`; seed 12345, batch 32768, AdamW
+  0.9 / 0.999, FT weight decay 0.0025, FT weight range 5, factorizer on. Trainer built 2026-11-15 17:34 from the
+  branch at `b0131e6` ("Trainer: Simplify repeated code", committed 17:42; unverified whether the build already
+  had that commit's non-functional change, the earlier commit is `d5a8a7e`). Validation RMSE 0.1155 at 100B.
+- Stage 2 (eval-ti-2): `trainCudaNetwork --resume eval-ti-1/eval-ti-1-100B.ckpt --restartSchedule --LR 1e-4
+  --endLR 2.5e-6 --startLambda 0 --endLambda 0 --trainingLength 120 --bucketLeak 0.5 --name eval-ti-2`. Float
+  weights, factorizer and Adam moments carried over, position count reset, 50-iteration warmup, cosine LR over
+  120B; no `--iterations`, stopped at 121.5B. Trainer built 2026-11-16 09:58 from `9199c96`. Validation targets
+  use lambda 1, so validation RMSE rose with lambda 0 (0.1155 -> 0.1196 in the first 0.15B) and was 0.1199 at 120B.
+  RTX 5070, about 2.3M positions/s. The 120B checkpoint was used.
+- Permuted with `utils permuteNet --net eval-ti-2-120B.pnn --maxPositions 1000000` on 15 selfplay files and
+  Fishtest1.epd.bin (`aa3da4e`, the first version that permutes the threat block): live 4-input L1 groups
+  100 -> 77 of 192 per evaluation, 0 mismatches on 100,000 positions. Bench 6386874 with or without permutation.
+- SHA-256 `41da7d5a07a7b8c5af8ac472a1ca5784b2a5a257df582f10c1d13d5cfc8e51f9`, identical to the trainer output.
+- Before release testing: the stage-2 80B checkpoint (before the anneal) scored +43.61 ± 12.37 against master
+  2.0.21 (`8563a46`) at 10k nodes in a local fastchess match (1682 games, UHO_Lichess_4852_v1). With this net
+  the branch at `ab62cfd` was 22.0% slower than master (MinGW `make bmi2`, bench depth 12, 1,683,433 vs
+  2,160,059 nps); `7e27d18` (+1.49%) and `c5d8d77` (+1.17%) sped it up since. No SPRT results recorded yet.
